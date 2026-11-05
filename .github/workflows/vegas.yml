@@ -1,0 +1,44 @@
+﻿name: 维加斯通道提醒
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # 需要写回 state.json，避免同一根 K 线重复报警
+
+concurrency:
+  group: vegas-alert
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 检查信号并推 Telegram
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          SYMBOLS: BTCUSDT,XAUUSD,SNDK
+          INTERVALS: 1h,4h,1d
+        run: python vegas_alert.py --once
+
+      - name: 保存已评估的 K 线状态
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "vegas-alert-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add state.json
+            git commit -m "chore: update alert state [skip ci]"
+            git push
+          else
+            echo "state.json 无变化"
+          fi
