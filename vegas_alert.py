@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 维加斯通道提醒 · 多品种 / 多周期 / 多指标 · Telegram 图片卡片推送
@@ -274,7 +274,7 @@ def get_closed_candles(symbol, interval, limit=1000):
     def finish(name, rows):
         rows = [r for r in rows if r[0] + step <= now]
         if len(rows) < 220:
-            short.append(f"{name} {len(rows)} 根")
+            short.append((len(rows), name))
             raise InsufficientHistory(f"{name} 只有 {len(rows)} 根收盘 K 线（需要 220 根）")
         return name, rows[-limit:]
 
@@ -313,7 +313,8 @@ def get_closed_candles(symbol, interval, limit=1000):
         except Exception as exc:  # noqa: BLE001
             errors.append(f"Yahoo:{base}: {type(exc).__name__}")
         if short:
-            raise InsufficientHistory(short[0])
+            n, nm = max(short)
+            raise InsufficientHistory(f"{nm} 只有 {n} 根")
         raise RuntimeError("行情源全挂 → " + " | ".join(errors))
 
     return finish(*fetch_yahoo(symbol, interval, limit))
@@ -532,11 +533,20 @@ def check_one(symbol, interval, state):
 
     fired_bars = []
     for i in pending:
-        r = analyse_vegas(closes, i)
-        fired = [SIGNAL_META[f][0] for f in SIGNAL_META if r.get(f)]
-        log(f"{symbol} {interval} | {source} | {r['info']} | {('、'.join(fired) if fired else '无信号')}")
+        merged, infos = {}, []
+        for _name, fn in INDICATORS.items():       # 想加指标：往 INDICATORS 里挂一个函数即可
+            res = fn(closes, i)
+            infos.append(res.get("info", ""))
+            for field in SIGNAL_META:
+                if res.get(field):
+                    merged[field] = True
+            merged.setdefault("close", res.get("close"))
+        merged["info"] = " | ".join(x for x in infos if x)
+
+        fired = [SIGNAL_META[f][0] for f in SIGNAL_META if merged.get(f)]
+        log(f"{symbol} {interval} | {source} | {merged['info']} | {('、'.join(fired) if fired else '无信号')}")
         if fired and not baseline_only:
-            fired_bars.append((rows[i][0], r, fired))
+            fired_bars.append((rows[i][0], merged, fired))
 
     state[key] = last_bar
     if not fired_bars:
