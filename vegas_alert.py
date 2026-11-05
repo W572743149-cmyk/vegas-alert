@@ -41,11 +41,11 @@ UA = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
 # 周期 → 各交易所的写法 / 秒数
 INTERVAL_META = {
-    "5m": {"sec": 300, "label": "5M", "binance": "5m", "okx": "5m", "gate": "5m"},
-    "15m": {"sec": 900, "label": "15M", "binance": "15m", "okx": "15m", "gate": "15m"},
-    "30m": {"sec": 1800, "label": "30M", "binance": "30m", "okx": "30m", "gate": "30m"},
-    "1h": {"sec": 3600, "label": "1H", "binance": "1h", "okx": "1H", "gate": "1h"},
-    "4h": {"sec": 14400, "label": "4H", "binance": "4h", "okx": "4H", "gate": "4h"},
+    "5m": {"sec": 300, "label": "5分钟", "binance": "5m", "okx": "5m", "gate": "5m"},
+    "15m": {"sec": 900, "label": "15分钟", "binance": "15m", "okx": "15m", "gate": "15m"},
+    "30m": {"sec": 1800, "label": "30分钟", "binance": "30m", "okx": "30m", "gate": "30m"},
+    "1h": {"sec": 3600, "label": "1小时", "binance": "1h", "okx": "1H", "gate": "1h"},
+    "4h": {"sec": 14400, "label": "4小时", "binance": "4h", "okx": "4H", "gate": "4h"},
     "1d": {"sec": 86400, "label": "日线", "binance": "1d", "okx": "1D", "gate": "1d"},
     "1w": {"sec": 604800, "label": "周线", "binance": "1w", "okx": "1W", "gate": "7d"},
     "1M": {"sec": 2592000, "label": "月线", "binance": "1M", "okx": "1M", "gate": "30d"},
@@ -228,27 +228,68 @@ def fetch_yahoo(symbol, interval, limit):
     raise RuntimeError(f"yahoo 失败：{type(last_err).__name__} {str(last_err)[:60]}")
 
 
+GOLD_SYMBOLS = {"XAUUSD", "XAU", "GOLD", "黄金", "PAXGUSDT", "XAUTUSDT"}
+
+
+class InsufficientHistory(RuntimeError):
+    """K 线不够，EMA144/169 还走不稳（新上线的小币常见）"""
+
+
 def get_closed_candles(symbol, interval, limit=1000):
-    """只保留已收盘的 K 线；加密走交易所、股票/黄金走 Yahoo"""
+    """只保留已收盘的 K 线；加密走交易所、股票走 Yahoo、现货黄金走 PAXG/XAUT"""
     step = INTERVAL_META[interval]["sec"]
     now = int(time.time())
+    errors = []
+    short = []
 
     def finish(name, rows):
         rows = [r for r in rows if r[0] + step <= now]
         if len(rows) < 220:
-            raise RuntimeError(f"{name} 只拿到 {len(rows)} 根收盘 K 线")
+            short.append(f"{name} 只有 {len(rows)} 根")
+            raise InsufficientHistory(f"{name} 只有 {len(rows)} 根收盘 K 线（需要 220 根）")
         return name, rows[-limit:]
 
-    if not is_crypto(symbol):
-        return finish(*fetch_yahoo(symbol, interval, limit))
+    up = symbol.upper()
 
-    errors = []
-    for name, fn in SOURCES:
-        try:
-            return finish(name, fn(symbol, interval, limit + 2))
+    # ---- 现货黄金：PAXG / XAUT 都是 1:1 锚定实物金，24 小时交易，比期货更接近现货 ----
+    if up in GOLD_SYMBOLS:
+        for name, fn in (
+            ("PAXG@Binance", lambda: fetch_binance("PAXGUSDT", interval, limit + 2,
+                                                   "https://data-api.binance.vision")),
+            ("PAXG@OKX", lambda: fetch_okx("PAXGUSDT", interval, limit + 2)),
+            ("PAXG@Gate", lambda: fetch_gate("PAXGUSDT", interval, limit + 2)),
+        ):
+            try:
+                return finish(name, fn())
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{name}: {type(exc).__name__} {str(exc)[:40]}")
+        try:  # 最后退回黄金期货
+            return finish(*fetch_yahoo("GC=F", interval, limit))
         except Exception as exc:  # noqa: BLE001
-            errors.append(f"{name}: {type(exc).__name__} {str(exc)[:50]}")
-    raise RuntimeError("行情源都失败 → " + " | ".join(errors))
+            errors.append(f"GC=F: {type(exc).__name__} {str(exc)[:40]}")
+        if short:
+            raise InsufficientHistory(short[0])
+        raise RuntimeError("黄金行情源都失败 → " + " | ".join(errors))
+
+    if is_crypto(symbol):
+        for name, fn in SOURCES:
+            try:
+                return finish(name, fn(symbol, interval, limit + 2))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{name}: {type(exc).__name__} {str(exc)[:40]}")
+        # 交易所都没有：可能是股票代码被写成了 XXXUSDT（例如 SNDKUSDT → SNDK）
+        base = split_symbol(symbol)[0]
+        try:
+            name, rows = fetch_yahoo(base, interval, limit)
+            log(f"说明：{symbol} 不是加密交易对，按美股 {base} 处理")
+            return finish(name, rows)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"yahoo:{base}: {type(exc).__name__} {str(exc)[:40]}")
+        if short:
+            raise InsufficientHistory(short[0])
+        raise RuntimeError("行情源都失败 → " + " | ".join(errors))
+
+    return finish(*fetch_yahoo(symbol, interval, limit))
 
 
 # ------------------------------ 指标 ------------------------------
@@ -263,8 +304,11 @@ def ema(values, length):
     return out
 
 
-def analyse(closes):
-    """复刻 Pine 逻辑，返回最后一根收盘 K 线上的四类信号"""
+def analyse(closes, idx=None):
+    """复刻 Pine 逻辑，返回第 idx 根收盘 K 线上的四类信号（默认最后一根）"""
+    if idx is None:
+        idx = len(closes) - 1
+    i = idx
     ema144 = ema(closes, 144)
     ema169 = ema(closes, 169)
     ema12 = ema(closes, 12)
@@ -272,12 +316,11 @@ def analyse(closes):
     lower = [min(a, b) for a, b in zip(ema144, ema169)]
 
     longs, shorts = [], []
-    for i in range(len(closes)):
-        c, e12, up, lo = closes[i], ema12[i], upper[i], lower[i]
-        longs.append(e12 > ema144[i] and e12 > ema169[i] and c > ema144[i] and c > ema169[i])
-        shorts.append(e12 < ema144[i] and e12 < ema169[i] and c < ema144[i] and c < ema169[i])
+    for k in range(len(closes)):
+        c, e12, up_, lo_ = closes[k], ema12[k], upper[k], lower[k]
+        longs.append(e12 > ema144[k] and e12 > ema169[k] and c > ema144[k] and c > ema169[k])
+        shorts.append(e12 < ema144[k] and e12 < ema169[k] and c < ema144[k] and c < ema169[k])
 
-    i = len(closes) - 1
     # Pine 里 trendState 是 var：取「当前 K 线之前最后一次出现的方向」
     trend_before = 0
     for j in range(i - 1, -1, -1):
@@ -291,8 +334,8 @@ def analyse(closes):
     long_signal = longs[i] and trend_before != 1
     short_signal = shorts[i] and trend_before != -1
 
-    golden_cross = ema12[i - 1] <= upper[i - 1] and ema12[i] > upper[i]
-    death_cross = ema12[i - 1] >= lower[i - 1] and ema12[i] < lower[i]
+    golden_cross = i >= 1 and ema12[i - 1] <= upper[i - 1] and ema12[i] > upper[i]
+    death_cross = i >= 1 and ema12[i - 1] >= lower[i - 1] and ema12[i] < lower[i]
 
     return {
         "long": long_signal,
@@ -353,43 +396,61 @@ def save_state(state):
         pass
 
 
+DISPLAY_NAMES = {
+    "XAUUSD": "现货黄金 XAUUSD",
+    "PAXGUSDT": "现货黄金 XAUUSD",
+    "SNDKUSDT": "SNDK 美股",
+    "SOXLBUSDT": "SOXLB",
+}
+
+HIT_NAMES = [
+    ("long", "🟢 趋势多头确认"),
+    ("short", "🔴 趋势空头确认"),
+    ("golden", "🟢 EMA12 独立金叉"),
+    ("death", "🔴 EMA12 独立死叉"),
+]
+
+
 def check_one(symbol, interval, state):
     source, rows = get_closed_candles(symbol, interval)
-    bar_time = rows[-1][0]
     key = f"{symbol}|{interval}"
+    last_bar = rows[-1][0]
+    done = state.get(key, 0)
 
-    if state.get(key) == bar_time:
+    if done >= last_bar:
         log(f"{symbol} {interval} | 源 {source} | 这根 K 线已评估过，跳过")
         return False
 
     closes = [r[1] for r in rows]
-    r = analyse(closes)
-    state[key] = bar_time  # 同一根 K 线不重复评估
+    # 云端每 5 分钟才跑一次，5m/15m 可能跨过好几根；补评估最近最多 3 根，避免漏信号也避免刷屏
+    pending = [i for i, r in enumerate(rows) if r[0] > done][-3:]
+    baseline_only = done == 0   # 第一次见到这个标的：只记账，不把历史旧信号翻出来报
+    if baseline_only:
+        log(f"{symbol} {interval} | 源 {source} | 首次运行，记录基线（不回溯报警）")
 
-    hits = [
-        ("🟢 趋势多头确认", r["long"]),
-        ("🔴 趋势空头确认", r["short"]),
-        ("🟢 EMA12 独立金叉", r["golden"]),
-        ("🔴 EMA12 独立死叉", r["death"]),
-    ]
-    fired = [name for name, ok in hits if ok]
-    summary = (
-        f"EMA12={fmt_price(r['ema12'])} 通道[{fmt_price(r['lower'])} ~ {fmt_price(r['upper'])}]"
-    )
-    log(
-        f"{symbol} {interval} | 源 {source} | {summary} | "
-        f"{'、'.join(n[2:] for n in fired) if fired else '无信号'}"
-    )
-    if not fired:
+    fired_bars = []
+    for i in pending:
+        r = analyse(closes, i)
+        fired = [name for field, name in HIT_NAMES if r[field]]
+        log(
+            f"{symbol} {interval} | 源 {source} | "
+            f"EMA12={fmt_price(r['ema12'])} 通道[{fmt_price(r['lower'])} ~ {fmt_price(r['upper'])}] | "
+            f"{'、'.join(n[2:] for n in fired) if fired else '无信号'}"
+        )
+        if fired and not baseline_only:
+            fired_bars.append((rows[i][0], r, fired))
+
+    state[key] = last_bar
+    if not fired_bars:
         return False
 
-    lines = list(fired) + [
-        "",
-        f"周期：{INTERVAL_META[interval]['label']}",
-        f"交易对：{symbol}",
-        f"价格：{fmt_price(r['close'])}",
-        f"时间：{time.strftime('%Y-%m-%d %H:%M', time.localtime(bar_time))}（K 线收盘）",
-    ]
+    title = DISPLAY_NAMES.get(symbol.upper(), symbol)
+    lines = [f"🔔 维加斯信号 · {title} · {INTERVAL_META[interval]['label']}"]
+    for ts, r, fired in fired_bars:
+        lines.append("")
+        lines.extend(fired)
+        lines.append(f"价格：{fmt_price(r['close'])}")
+        lines.append(f"时间：{time.strftime('%m-%d %H:%M', time.localtime(ts))}（K 线收盘）")
     send_telegram("\n".join(lines))
     return True
 
@@ -416,6 +477,8 @@ def main():
                     continue
                 try:
                     changed = check_one(symbol, interval, state) or changed
+                except InsufficientHistory as exc:
+                    log(f"{symbol} {interval} | 暂时跳过（{exc}）")
                 except Exception as exc:  # noqa: BLE001
                     log(f"{symbol} {interval} 出错：{type(exc).__name__}: {exc}")
         save_state(state)
