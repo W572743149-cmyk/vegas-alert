@@ -27,8 +27,8 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
-          SYMBOLS: BTCUSDT,XAUUSD,SNDK
-          INTERVALS: 1h,4h,1d
+          SYMBOLS: BTCUSDT,SNDKUSDT,XAUUSD,SOXLBUSDT
+          INTERVALS: 5m,15m,1h,4h,1d
         run: python vegas_alert.py --once
 
       - name: 保存已评估的 K 线状态
