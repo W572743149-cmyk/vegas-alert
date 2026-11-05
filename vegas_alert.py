@@ -414,10 +414,11 @@ def analyse_rsi(closes, idx=None):
     }
 
 
-# 想加指标就写一个 analyse_xxx 再挂到这里，check_one 会自动跑全部
+# 想加指标就写一个 analyse_xxx 再挂到这里，check_one 会自动跑
+# 格式： 名称: (函数, 只在哪些周期跑；None 表示所有周期都跑)
 INDICATORS = {
-    "维加斯": analyse_vegas,
-    "RSI": analyse_rsi,
+    "维加斯": (analyse_vegas, None),
+    "RSI": (analyse_rsi, {"1h", "4h", "1w"}),   # 超买超卖只在 1小时 / 4小时 / 周线 报
 }
 
 
@@ -531,33 +532,12 @@ def send_telegram(text):
     return False
 
 
-def chart_links(symbol):
-    """点一下就能跳到对应看盘软件的深度链接"""
-    up = symbol.upper()
-    if up in GOLD_SYMBOLS:
-        return [
-            ("币安 PAXG", "https://www.binance.com/zh-CN/futures/PAXGUSDT"),
-            ("TradingView 现货金", "https://cn.tradingview.com/chart/?symbol=OANDA%3AXAUUSD"),
-        ]
-    if is_crypto(up):
-        return [
-            (f"币安 {up}", f"https://www.binance.com/zh-CN/futures/{up}"),
-            ("TradingView", f"https://cn.tradingview.com/chart/?symbol=BINANCE%3A{up}.P"),
-        ]
-    return [("TradingView", f"https://cn.tradingview.com/chart/?symbol={urllib.parse.quote(up)}")]
-
-
-def send_card(card_png, caption, buttons=None):
+def send_card(card_png, caption):
     if not TG_TOKEN or not TG_CHAT:
         log("（没配 Telegram，只打印卡片说明）\n" + caption)
         return False
     try:
         fields = {"chat_id": TG_CHAT, "caption": caption}
-        if buttons:
-            fields["reply_markup"] = json.dumps(
-                {"inline_keyboard": [[{"text": t, "url": u} for t, u in buttons]]},
-                ensure_ascii=False,
-            )
         r = _post_multipart(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
             fields, "photo", "signal.png", card_png,
@@ -606,7 +586,9 @@ def check_one(symbol, interval, state):
     fired_bars = []
     for i in pending:
         merged, infos = {}, []
-        for _name, fn in INDICATORS.items():       # 想加指标：往 INDICATORS 里挂一个函数即可
+        for _name, (fn, only) in INDICATORS.items():
+            if only and interval not in only:
+                continue
             res = fn(closes, i)
             infos.append(res.get("info", ""))
             for field in SIGNAL_META:
@@ -635,7 +617,7 @@ def check_one(symbol, interval, state):
         f"{INTERVAL_META[interval]['label']}\n" + "\n".join(fired) +
         f"\n价格 {r['close']:,.2f}\n{time.strftime('%m-%d %H:%M', time.localtime(ts))} 收盘"
     )
-    if card and send_card(card, caption, chart_links(symbol)):
+    if card and send_card(card, caption):
         return True
     send_telegram(caption)
     return True
@@ -667,8 +649,7 @@ def main():
         for direction, label, fired in examples:
             card = render_card("BTCUSDT", "5分钟", fired, direction, "76,388.00",
                                int(time.time()), "EMA12 76,388.00 / 通道 78,649 ~ 78,706 | RSI14 27.4")
-            send_card(card, f"{label} · 示例卡片 · BTCUSDT · 5分钟\n价格 76,388.00",
-                      chart_links("BTCUSDT"))
+            send_card(card, f"{label} · 示例卡片 · BTCUSDT · 5分钟\n价格 76,388.00")
         return
 
     if "--test" in sys.argv:
