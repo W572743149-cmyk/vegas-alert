@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 维加斯通道提醒 · 多品种 / 多周期 / 多指标 · Telegram 图片卡片推送
@@ -64,7 +64,14 @@ SIGNAL_META = {
     "golden": ("EMA12 独立金叉", 1),
     "short": ("趋势空头确认", -1),
     "death": ("EMA12 独立死叉", -1),
+    "oversold": ("RSI 超卖", 1),
+    "overbought": ("RSI 超买", -1),
 }
+
+# RSI 参数（可用环境变量覆盖）
+RSI_PERIOD = int(os.environ.get("RSI_PERIOD", "14"))
+RSI_OB = float(os.environ.get("RSI_OB", "70"))
+RSI_OS = float(os.environ.get("RSI_OS", "30"))
 
 
 def log(msg):
@@ -365,9 +372,52 @@ def analyse_vegas(closes, idx=None):
     }
 
 
+def _rsi_value(ag, al):
+    if ag == 0 and al == 0:
+        return 50.0          # 完全横盘：中性
+    if al == 0:
+        return 100.0
+    return 100 - 100 / (1 + ag / al)
+
+
+def rsi_series(closes, period):
+    """Wilder RSI"""
+    out = [None] * len(closes)
+    if len(closes) <= period:
+        return out
+    gains = losses = 0.0
+    for k in range(1, period + 1):
+        d = closes[k] - closes[k - 1]
+        gains += max(d, 0.0)
+        losses += max(-d, 0.0)
+    ag, al = gains / period, losses / period
+    out[period] = _rsi_value(ag, al)
+    for k in range(period + 1, len(closes)):
+        d = closes[k] - closes[k - 1]
+        ag = (ag * (period - 1) + max(d, 0.0)) / period
+        al = (al * (period - 1) + max(-d, 0.0)) / period
+        out[k] = _rsi_value(ag, al)
+    return out
+
+
+def analyse_rsi(closes, idx=None):
+    """超买 / 超卖：只在「刚进入」超买超卖区时报一次，不重复刷"""
+    i = len(closes) - 1 if idx is None else idx
+    r = rsi_series(closes, RSI_PERIOD)
+    if i < 1 or r[i] is None or r[i - 1] is None:
+        return {"info": ""}
+    cur, prev = r[i], r[i - 1]
+    return {
+        "oversold": prev >= RSI_OS and cur < RSI_OS,      # 跌破 30 → 超卖
+        "overbought": prev <= RSI_OB and cur > RSI_OB,    # 涨破 70 → 超买
+        "info": f"RSI{RSI_PERIOD} {cur:.1f}",
+    }
+
+
 # 想加指标就写一个 analyse_xxx 再挂到这里，check_one 会自动跑全部
 INDICATORS = {
     "维加斯": analyse_vegas,
+    "RSI": analyse_rsi,
 }
 
 
@@ -398,7 +448,7 @@ def render_card(symbol, tf_label, fired, direction, price, ts, info=""):
     bg = (183, 28, 28) if is_long else (27, 94, 32)          # 红涨 / 绿跌
     if direction == 0:
         bg = (55, 71, 79)
-    W, H = 900, 560
+    W, H = 900, 600
     img = Image.new("RGB", (W, H), bg)
     d = ImageDraw.Draw(img)
 
@@ -425,16 +475,16 @@ def render_card(symbol, tf_label, fired, direction, price, ts, info=""):
     d.text((44, 128), action, font=f_action, fill=(255, 255, 255))
     d.line([48, 262, W - 48, 262], fill=(255, 255, 255, 80), width=2)
 
-    y = 282
-    for line in fired[:2]:
+    y = 276
+    for line in fired[:3]:
         d.text((48, y), f"· {line}", font=f_line, fill=(255, 255, 255))
-        y += 48
+        y += 46
 
-    d.text((44, 396), price, font=f_price, fill=(255, 255, 255))
-    d.text((48, 476), f"{time.strftime('%m-%d %H:%M', time.localtime(ts))} 收盘",
+    d.text((44, 432), price, font=f_price, fill=(255, 255, 255))
+    d.text((48, 506), f"{time.strftime('%m-%d %H:%M', time.localtime(ts))} 收盘",
            font=f_small, fill=(255, 226, 226))
     if info:
-        d.text((48, 510), fit(info, f_small, W - 96), font=f_small, fill=(255, 210, 210))
+        d.text((48, 542), fit(info, f_small, W - 96), font=f_small, fill=(255, 210, 210))
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -481,14 +531,36 @@ def send_telegram(text):
     return False
 
 
-def send_card(card_png, caption):
+def chart_links(symbol):
+    """点一下就能跳到对应看盘软件的深度链接"""
+    up = symbol.upper()
+    if up in GOLD_SYMBOLS:
+        return [
+            ("币安 PAXG", "https://www.binance.com/zh-CN/futures/PAXGUSDT"),
+            ("TradingView 现货金", "https://cn.tradingview.com/chart/?symbol=OANDA%3AXAUUSD"),
+        ]
+    if is_crypto(up):
+        return [
+            (f"币安 {up}", f"https://www.binance.com/zh-CN/futures/{up}"),
+            ("TradingView", f"https://cn.tradingview.com/chart/?symbol=BINANCE%3A{up}.P"),
+        ]
+    return [("TradingView", f"https://cn.tradingview.com/chart/?symbol={urllib.parse.quote(up)}")]
+
+
+def send_card(card_png, caption, buttons=None):
     if not TG_TOKEN or not TG_CHAT:
         log("（没配 Telegram，只打印卡片说明）\n" + caption)
         return False
     try:
+        fields = {"chat_id": TG_CHAT, "caption": caption}
+        if buttons:
+            fields["reply_markup"] = json.dumps(
+                {"inline_keyboard": [[{"text": t, "url": u} for t, u in buttons]]},
+                ensure_ascii=False,
+            )
         r = _post_multipart(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
-            {"chat_id": TG_CHAT, "caption": caption}, "photo", "signal.png", card_png,
+            fields, "photo", "signal.png", card_png,
         )
         if r.get("ok"):
             log("✅ 卡片已推送 Telegram")
@@ -563,7 +635,7 @@ def check_one(symbol, interval, state):
         f"{INTERVAL_META[interval]['label']}\n" + "\n".join(fired) +
         f"\n价格 {r['close']:,.2f}\n{time.strftime('%m-%d %H:%M', time.localtime(ts))} 收盘"
     )
-    if card and send_card(card, caption):
+    if card and send_card(card, caption, chart_links(symbol)):
         return True
     send_telegram(caption)
     return True
@@ -588,11 +660,15 @@ def sweep(state):
 
 def main():
     if "--demo" in sys.argv:
-        for direction, label in ((1, "做多"), (-1, "做空")):
-            fired = ["趋势多头确认", "EMA12 独立金叉"] if direction > 0 else ["趋势空头确认", "EMA12 独立死叉"]
+        examples = [
+            (1, "做多", ["趋势多头确认", "EMA12 独立金叉", "RSI 超卖"]),
+            (-1, "做空", ["趋势空头确认", "EMA12 独立死叉", "RSI 超买"]),
+        ]
+        for direction, label, fired in examples:
             card = render_card("BTCUSDT", "5分钟", fired, direction, "76,388.00",
-                               int(time.time()), "EMA12 76,388.00 / 通道 78,649 ~ 78,706")
-            send_card(card, f"{label} · 示例卡片 · BTCUSDT · 5分钟\n价格 76,388.00")
+                               int(time.time()), "EMA12 76,388.00 / 通道 78,649 ~ 78,706 | RSI14 27.4")
+            send_card(card, f"{label} · 示例卡片 · BTCUSDT · 5分钟\n价格 76,388.00",
+                      chart_links("BTCUSDT"))
         return
 
     if "--test" in sys.argv:
