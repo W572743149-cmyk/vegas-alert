@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 维加斯通道提醒 · 多品种 / 多周期 / 多指标 · Telegram 图片卡片推送
@@ -416,7 +416,7 @@ def _load_font(size):
     return ImageFont.load_default()
 
 
-def render_card(symbol, tf_label, fired, direction, price, close_ts, info="", delayed=False):
+def render_card(symbol, tf_label, fired, direction, price, bar_ts, close_ts, info="", delayed=False):
     """做多=红底，做空=绿底，延迟的用灰底。返回 PNG bytes；Pillow 不可用时返回 None"""
     try:
         from PIL import Image, ImageDraw
@@ -465,8 +465,9 @@ def render_card(symbol, tf_label, fired, direction, price, close_ts, info="", de
         y += 46
 
     d.text((44, 432), price, font=f_price, fill=(255, 255, 255))
-    # 主时间 = 触发那根 K 线的「收盘时间」（信号就是这一刻成立的）
-    stamp = f"{fmt_time(close_ts)} 收盘（北京时间）"
+    # 时间格式：日期 + 这根 K 线的开盘→收盘
+    stamp = (f"{fmt_time(close_ts, '%m-%d')}  K线 "
+             f"{fmt_time(bar_ts, '%H:%M')}→{fmt_time(close_ts, '%H:%M')}")
     if delayed:
         minutes = max(0, int((time.time() - close_ts) / 60))
         stamp += f" · 延迟 {minutes} 分钟（灰底）"
@@ -613,12 +614,12 @@ def check_one(symbol, interval, state):
 
         price = fmt_price(bar_close)
         card = render_card(symbol, INTERVAL_META[interval]["label"], fired, direction,
-                           price, close_ts, r["info"], delayed)
+                           price, ts, close_ts, r["info"], delayed)
         caption = (
             f"{'做多' if direction > 0 else '做空'} · {DISPLAY_NAMES.get(symbol.upper(), symbol)} · "
             f"{INTERVAL_META[interval]['label']}\n" + "\n".join(fired) +
-            f"\n收盘价 {price}\n{fmt_time(close_ts)} 收盘（北京时间）"
-            f"｜K线 {fmt_time(ts, '%H:%M')}→{fmt_time(close_ts, '%H:%M')}"
+            f"\n收盘价 {price}\n{fmt_time(close_ts, '%m-%d')}  K线 "
+            f"{fmt_time(ts, '%H:%M')}→{fmt_time(close_ts, '%H:%M')}"
         )
         if delayed:
             caption += f"\n⚠️ 延迟 {delay_min:.0f} 分钟"
@@ -683,13 +684,13 @@ def replay(day_str):
                 info = " | ".join(x for x in infos if x)
                 price = fmt_price(closes[i])
                 card = render_card(symbol, INTERVAL_META[interval]["label"], fired,
-                                   direction, price, close_ts, info)
+                                   direction, price, rows[i][0], close_ts, info)
                 caption = (
                     f"【回放】{'做多' if direction > 0 else '做空'} · "
                     f"{DISPLAY_NAMES.get(symbol.upper(), symbol)} · {INTERVAL_META[interval]['label']}\n"
                     + "\n".join(fired)
-                    + f"\n收盘价 {price}\n{fmt_time(close_ts)} 收盘（北京时间）"
-                    + f"｜K线 {fmt_time(rows[i][0], '%H:%M')}→{fmt_time(close_ts, '%H:%M')}"
+                    + f"\n收盘价 {price}\n{fmt_time(close_ts, '%m-%d')}  K线 "
+                    + f"{fmt_time(rows[i][0], '%H:%M')}→{fmt_time(close_ts, '%H:%M')}"
                 )
                 if not (card and send_card(card, caption)):
                     send_telegram(caption)
@@ -713,7 +714,7 @@ def main():
         now = int(time.time())
         for direction, label, fired in examples:
             card = render_card("BTCUSDT", "15分钟", fired, direction, "76,388.00",
-                               now, "EMA12 76,388.00 / 通道 78,649 ~ 78,706")
+                               now - 900, now, "EMA12 76,388.00 / 通道 78,649 ~ 78,706")
             send_card(card, f"{label} · 示例卡片 · BTCUSDT · 5分钟\n价格 76,388.00")
         return
 
