@@ -1,0 +1,57 @@
+name: 心跳看门狗
+
+# 每隔 20 分钟检查一次：维加斯提醒是否还有活的运行。
+# 如果最新的运行已经结束、且最后一次开始超过 25 分钟，就补触发一次（chain=true），
+# 相当于「检查自己有没有忘记敲门」。
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检查是否断档
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          resp=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+                       -H "Accept: application/vnd.github+json" \
+                       -H "X-GitHub-Api-Version: 2022-11-28" \
+                       "https://api.github.com/repos/$REPO/actions/workflows/vegas.yml/runs?per_page=1")
+
+          status=$(echo "$resp" | jq -r '.workflow_runs[0].status // "none"')
+          created=$(echo "$resp" | jq -r '.workflow_runs[0].created_at // empty')
+          echo "最近一次运行：status=$status created=$created"
+
+          if [ "$status" = "queued" ] || [ "$status" = "in_progress" ] || [ "$status" = "waiting" ]; then
+            echo "还有活着的运行，不用补"
+            exit 0
+          fi
+
+          if [ -z "$created" ]; then
+            age=99999
+          else
+            age=$(( ( $(date -u +%s) - $(date -u -d "$created" +%s) ) / 60 ))
+          fi
+          echo "距上次开始：$age 分钟"
+
+          if [ "$age" -gt 25 ]; then
+            echo "⚠️ 断档了，补触发一次"
+            curl -s -o /dev/null -w "dispatch=%{http_code}\n" -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$REPO/actions/workflows/vegas.yml/dispatches" \
+              -d '{"ref":"main","inputs":{"chain":"true"}}'
+          else
+            echo "✅ 正常运行中（25 分钟内有过运行）"
+          fi
