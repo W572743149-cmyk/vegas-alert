@@ -591,7 +591,9 @@ def check_one(symbol, interval, state):
             # 记住这根 K 线自己的收盘价，保证推送价 = 触发那根 K 线的收盘价
             fired_bars.append((rows[i][0], closes[i], merged, fired))
 
+    step = INTERVAL_META[interval]["sec"]
     state[key] = last_bar
+    state[f"{key}|nextcheck"] = last_bar + 2 * step + 5   # 等下一根收盘再来查，省流量
     if not fired_bars:
         return False
 
@@ -600,7 +602,6 @@ def check_one(symbol, interval, state):
         log(f"{symbol} {interval} | 本次共 {len(fired_bars)} 条，只补发最近 10 条")
         fired_bars = fired_bars[-10:]
 
-    step = INTERVAL_META[interval]["sec"]
     sent = False
     for ts, bar_close, r, fired in fired_bars:
         directions = {SIGNAL_META[f][1] for f in SIGNAL_META if r.get(f)}
@@ -632,15 +633,21 @@ def check_one(symbol, interval, state):
 
 def sweep(state):
     changed = False
+    now = time.time()
     for symbol in SYMBOLS:
         for interval in INTERVALS:
             if interval not in INTERVAL_META:
                 log(f"跳过未知周期 {interval}")
                 continue
+            # 省流量：这根 K 线还没收盘就别去拉数据（手机上很重要）
+            wait_key = f"{symbol}|{interval}|nextcheck"
+            if now < state.get(wait_key, 0):
+                continue
             try:
                 changed = check_one(symbol, interval, state) or changed
             except InsufficientHistory as exc:
                 log(f"{symbol} {interval} | 暂时跳过（{exc}）")
+                state[wait_key] = now + 3600          # 历史不够，一小时后再说
             except Exception as exc:  # noqa: BLE001
                 log(f"{symbol} {interval} 出错：{type(exc).__name__}: {exc}")
     save_state(state)
