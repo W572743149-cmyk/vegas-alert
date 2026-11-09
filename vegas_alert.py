@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 维加斯通道提醒 · 多品种 / 多周期 / 多指标 · Telegram 图片卡片推送
@@ -15,11 +15,13 @@
   CHECK_EVERY           本机轮询秒数
   STATE_FILE            状态文件路径
 """
+import datetime
 import io
 import json
 import os
 import sys
 import time
+from datetime import timedelta, timezone
 import urllib.parse
 import urllib.request
 import uuid
@@ -29,12 +31,36 @@ TG_CHAT = os.environ.get("TG_CHAT", "")
 SYMBOLS = [s.strip().upper() for s in os.environ.get("SYMBOLS", "BTCUSDT").split(",") if s.strip()]
 INTERVALS = [s.strip() for s in os.environ.get("INTERVALS", "1h,4h,1d").split(",") if s.strip()]
 CHECK_EVERY = int(os.environ.get("CHECK_EVERY", "60"))
+MAX_DELAY_MIN = float(os.environ.get("MAX_DELAY_MIN", "20"))   # 超过这么久才发现的信号直接丢弃，不推过期信号
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.environ.get("STATE_FILE") or os.path.join(BASE, "state.json")
 LOG_FILE = os.path.join(BASE, "alerts.log")
 FONT_FILE = os.path.join(BASE, "vegas_font.ttf")
 UA = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+
+# 全部时间统一按北京时间显示（GitHub 的服务器是 UTC，不能直接用 localtime）
+try:
+    from zoneinfo import ZoneInfo
+
+    TZ = ZoneInfo("Asia/Shanghai")
+except Exception:  # noqa: BLE001
+    TZ = timezone(timedelta(hours=8))
+
+
+def fmt_time(ts, fmt="%m-%d %H:%M"):
+    return datetime.datetime.fromtimestamp(ts, TZ).strftime(fmt)
+
+
+def fmt_price(p):
+    """按价位大小给合适的小数位，避免 0.00001234 被截成 0.00"""
+    if p >= 1000:
+        return f"{p:,.2f}"
+    if p >= 1:
+        return f"{p:,.2f}".rstrip("0").rstrip(".")
+    if p >= 0.01:
+        return f"{p:.4f}".rstrip("0").rstrip(".")
+    return f"{p:.8f}".rstrip("0").rstrip(".")
 
 # 周期 → 各数据源的写法 / 秒数 / 中文名
 INTERVAL_META = {
@@ -61,9 +87,9 @@ DISPLAY_NAMES = {
 # 信号 → (文案, 方向)  方向: +1 做多 / -1 做空
 SIGNAL_META = {
     "long": ("趋势多头确认", 1),
-    "golden": ("EMA12 独立金叉", 1),
+
     "short": ("趋势空头确认", -1),
-    "death": ("EMA12 独立死叉", -1),
+
     "oversold": ("RSI 超卖", 1),
     "overbought": ("RSI 超买", -1),
 }
@@ -75,7 +101,7 @@ RSI_OS = float(os.environ.get("RSI_OS", "30"))
 
 
 def log(msg):
-    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    line = f"[{fmt_time(time.time(), '%Y-%m-%d %H:%M:%S')}] {msg}"
     print(line, flush=True)
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as fh:
@@ -362,8 +388,7 @@ def analyse_vegas(closes, idx=None):
     return {
         "long": longs[i] and trend_before != 1,
         "short": shorts[i] and trend_before != -1,
-        "golden": i >= 1 and e12[i - 1] <= upper[i - 1] and e12[i] > upper[i],
-        "death": i >= 1 and e12[i - 1] >= lower[i - 1] and e12[i] < lower[i],
+
         "close": closes[i],
         "ema12": e12[i],
         "upper": upper[i],
@@ -438,7 +463,7 @@ def _load_font(size):
     return ImageFont.load_default()
 
 
-def render_card(symbol, tf_label, fired, direction, price, ts, info=""):
+def render_card(symbol, tf_label, fired, direction, price, ts, info="", late_note=""):
     """做多=红底，做空=绿底，白字。返回 PNG bytes；Pillow 不可用时返回 None"""
     try:
         from PIL import Image, ImageDraw
@@ -482,7 +507,7 @@ def render_card(symbol, tf_label, fired, direction, price, ts, info=""):
         y += 46
 
     d.text((44, 432), price, font=f_price, fill=(255, 255, 255))
-    d.text((48, 506), f"{time.strftime('%m-%d %H:%M', time.localtime(ts))} 收盘",
+    d.text((48, 506), f"{fmt_time(ts)} 收盘（北京时间）{late_note}",
            font=f_small, fill=(255, 226, 226))
     if info:
         d.text((48, 542), fit(info, f_small, W - 96), font=f_small, fill=(255, 210, 210))
@@ -578,7 +603,7 @@ def check_one(symbol, interval, state):
         return False
 
     closes = [r[1] for r in rows]
-    pending = [i for i, r in enumerate(rows) if r[0] > done][-3:]
+    pending = [i for i, r in enumerate(rows) if r[0] > done][-500:]
     baseline_only = done == 0
     if baseline_only:
         log(f"{symbol} {interval} | {source} | 首次运行，记录基线")
@@ -600,22 +625,37 @@ def check_one(symbol, interval, state):
         fired = [SIGNAL_META[f][0] for f in SIGNAL_META if merged.get(f)]
         log(f"{symbol} {interval} | {source} | {merged['info']} | {('、'.join(fired) if fired else '无信号')}")
         if fired and not baseline_only:
-            fired_bars.append((rows[i][0], merged, fired))
+            # 记住这根 K 线自己的收盘价，保证推送价 = 触发那根 K 线的收盘价
+            fired_bars.append((rows[i][0], closes[i], merged, fired))
 
     state[key] = last_bar
     if not fired_bars:
         return False
 
-    ts, r, fired = fired_bars[-1]
+    if len(fired_bars) > 3:                 # 间隔太久时只补发最近 3 根，避免一次炸屏
+        skipped = len(fired_bars) - 3
+        fired_bars = fired_bars[-3:]
+        log(f"{symbol} {interval} | 本次补评估 {len(pending)} 根，较早的 {skipped} 条信号已折叠")
+
+    ts, bar_close, r, fired = fired_bars[-1]
     directions = {SIGNAL_META[f][1] for f in SIGNAL_META if r.get(f)}
     direction = 1 if directions == {1} else (-1 if directions == {-1} else 0)
 
+    step = INTERVAL_META[interval]["sec"]
+    close_ts = ts + step                      # K 线「收盘」时间 = 开盘 + 周期
+    delay_min = (time.time() - close_ts) / 60
+
+    # 拒绝延迟：距离这根 K 线收盘太久才发现的信号，直接丢弃不推送
+    if delay_min > MAX_DELAY_MIN:
+        log(f"{symbol} {interval} | 信号过期：{fmt_time(close_ts)} 收盘，已过去 {delay_min:.0f} 分钟，不推送")
+        return False
+
     card = render_card(symbol, INTERVAL_META[interval]["label"], fired, direction,
-                       f"{r['close']:,.2f}", ts, r["info"])
+                       fmt_price(bar_close), close_ts, r["info"])
     caption = (
         f"{'做多' if direction > 0 else '做空'} · {DISPLAY_NAMES.get(symbol.upper(), symbol)} · "
         f"{INTERVAL_META[interval]['label']}\n" + "\n".join(fired) +
-        f"\n价格 {r['close']:,.2f}\n{time.strftime('%m-%d %H:%M', time.localtime(ts))} 收盘"
+        f"\n收盘价 {fmt_price(bar_close)}\n{fmt_time(close_ts)} 收盘（北京时间）"
     )
     if card and send_card(card, caption):
         return True
@@ -640,7 +680,64 @@ def sweep(state):
     return changed
 
 
+def replay(day_str):
+    """把指定日期（北京时间）当天所有触发过的信号重新推一遍，用于核对"""
+    day = datetime.datetime.strptime(day_str, "%Y-%m-%d").replace(tzinfo=TZ)
+    start, end = day.timestamp(), day.timestamp() + 86400
+    total = 0
+    for symbol in SYMBOLS:
+        for interval in INTERVALS:
+            if interval not in INTERVAL_META:
+                continue
+            try:
+                source, rows = get_closed_candles(symbol, interval)
+            except Exception as exc:  # noqa: BLE001
+                log(f"{symbol} {interval} | 回放取数失败：{type(exc).__name__}: {exc}")
+                continue
+            closes = [r[1] for r in rows]
+            step = INTERVAL_META[interval]["sec"]
+            for i in range(1, len(rows)):
+                close_ts = rows[i][0] + step
+                if not (start <= close_ts < end):
+                    continue
+                merged, infos = {}, []
+                for _n, (fn, only) in INDICATORS.items():
+                    if only and interval not in only:
+                        continue
+                    res = fn(closes, i)
+                    infos.append(res.get("info", ""))
+                    for field in SIGNAL_META:
+                        if res.get(field):
+                            merged[field] = True
+                fired = [SIGNAL_META[f][0] for f in SIGNAL_META if merged.get(f)]
+                if not fired:
+                    continue
+                directions = {SIGNAL_META[f][1] for f in SIGNAL_META if merged.get(f)}
+                direction = 1 if directions == {1} else (-1 if directions == {-1} else 0)
+                info = " | ".join(x for x in infos if x)
+                price = fmt_price(closes[i])
+                card = render_card(symbol, INTERVAL_META[interval]["label"], fired,
+                                   direction, price, close_ts, info)
+                caption = (
+                    f"【回放】{'做多' if direction > 0 else '做空'} · "
+                    f"{DISPLAY_NAMES.get(symbol.upper(), symbol)} · {INTERVAL_META[interval]['label']}\n"
+                    + "\n".join(fired)
+                    + f"\n收盘价 {price}\n{fmt_time(close_ts)} 收盘（北京时间）"
+                )
+                if not (card and send_card(card, caption)):
+                    send_telegram(caption)
+                total += 1
+                time.sleep(1)
+    log(f"回放完成：{day_str} 共 {total} 条")
+
+
 def main():
+    if "--replay" in sys.argv:
+        idx = sys.argv.index("--replay")
+        day = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else fmt_time(time.time(), "%Y-%m-%d")
+        replay(day)
+        return
+
     if "--demo" in sys.argv:
         examples = [
             (1, "做多", ["趋势多头确认", "EMA12 独立金叉", "RSI 超卖"]),
