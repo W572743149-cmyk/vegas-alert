@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 维加斯通道提醒 · 多品种 / 多周期 / 多指标 · Telegram 图片卡片推送
